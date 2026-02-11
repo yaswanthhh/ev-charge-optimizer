@@ -55,7 +55,10 @@ app.post("/optimize", (req, res) => {
     // Split equally across connectors, clip by each connector max
     const perConnectorKw: number[][] = Array.from({ length: steps }, (_, t) => {
         const equalShare = siteCapKw[t] / n;
-        return body.connectorMaxKw.map((mx) => Math.max(0, Math.min(mx, equalShare)));
+        return body.connectorMaxKw.map((mx) => {
+            const kw = Math.max(0, Math.min(mx, equalShare));
+            return Math.round(kw * 100) / 100; // 2 decimals
+        });
     });
 
     // Actual site kW is the sum (after clipping)
@@ -142,6 +145,8 @@ app.post("/run-and-dispatch", async (req, res) => {
         siteMaxKw: number;
         connectorMaxKw: number[];
         gridLimitKw?: number[];
+        priceSekPerKwh?: number[];
+        alpha?: number;
         steps?: number;
         stepSeconds?: number;
         chargerId?: string;
@@ -151,7 +156,7 @@ app.post("/run-and-dispatch", async (req, res) => {
     const stepSeconds = body.stepSeconds ?? 900;
     const chargerId = body.chargerId ?? "charger-001";
 
-    // 1) optimize (reuse the same logic as /optimize)
+    // 1) optimize (constraints + grid + price throttle)
     const n = body.connectorMaxKw?.length ?? 0;
     if (!body.siteMaxKw || body.siteMaxKw <= 0 || n === 0) {
         return res.status(400).json({ error: "siteMaxKw > 0 and connectorMaxKw[] required" });
@@ -162,15 +167,48 @@ app.post("/run-and-dispatch", async (req, res) => {
         return Math.min(body.siteMaxKw, grid ?? body.siteMaxKw);
     });
 
+    const price = body.priceSekPerKwh;
+    const alpha = body.alpha ?? 0.7;
+
+    // Normalize prices to 0..1 (0 cheapest, 1 most expensive)
+    const priceNorm: number[] | undefined =
+        price && price.length >= steps
+            ? (() => {
+                const slice = price.slice(0, steps);
+                const minP = Math.min(...slice);
+                const maxP = Math.max(...slice);
+                const denom = maxP - minP;
+                return slice.map((p) => (denom === 0 ? 0 : (p - minP) / denom));
+            })()
+            : undefined;
+
+    // Apply price-based throttle to cap
+    const effectiveCapKw = siteCapKw.map((cap, t) => {
+        if (!priceNorm) return cap;
+        const mult = 1 - alpha * priceNorm[t]; // expensive => lower
+        return Math.max(0, cap * mult);
+    });
+
     const perConnectorKw: number[][] = Array.from({ length: steps }, (_, t) => {
-        const equalShare = siteCapKw[t] / n;
+        const equalShare = effectiveCapKw[t] / n;
         return body.connectorMaxKw.map((mx) => Math.max(0, Math.min(mx, equalShare)));
     });
+
+    const siteKw = perConnectorKw.map((row) => row.reduce((a, b) => a + b, 0));
+
+    // SEK = (kW * hours) * (SEK/kWh)
+    const hoursPerStep = stepSeconds / 3600;
+    const estimatedCostSek =
+        price && price.length >= steps
+            ? siteKw.reduce((acc, kw, t) => acc + kw * hoursPerStep * price[t], 0)
+            : null;
 
     const optimizeOutput = {
         steps,
         perConnectorKw,
-        siteKw: perConnectorKw.map((row) => row.reduce((a, b) => a + b, 0)),
+        siteKw,
+        effectiveCapKw,
+        estimatedCostSek,
     };
 
     // 2) build + dispatch one OCPP profile per connectorId (1..n)
@@ -181,7 +219,7 @@ app.post("/run-and-dispatch", async (req, res) => {
 
         const chargingSchedulePeriod = perStepKw.map((kw, idx) => ({
             startPeriod: idx * stepSeconds,
-            limit: Math.round(kw * 1000 * 10) / 10,
+            limit: Math.round(kw * 1000 * 10) / 10, // W
         }));
 
         const setChargingProfile = {
@@ -198,7 +236,7 @@ app.post("/run-and-dispatch", async (req, res) => {
             },
         };
 
-        // your existing stub
+        // stubbed dispatch result
         return {
             connectorId,
             result: { status: "Accepted" as const },
@@ -220,6 +258,7 @@ app.post("/run-and-dispatch", async (req, res) => {
         dispatchResults,
     });
 });
+
 
 const port = Number(process.env.PORT ?? 3000);
 app.listen(port, () => console.log(`API listening on http://localhost:${port}`));
