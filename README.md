@@ -2,8 +2,6 @@
 
 A small full‑stack demo that **optimizes EV charging power over time** based on site/grid limits and electricity price, then tries to **dispatch** the planned limits to charger connectors.
 
----
-
 ## What the app does
 
 1. **Frontend (React + Vite)**
@@ -16,8 +14,6 @@ A small full‑stack demo that **optimizes EV charging power over time** based o
    - Produces an optimized power schedule per time step.
    - Builds per‑connector charging profiles (limits in W).
    - Attempts to dispatch those profiles to a charger connection.
-
----
 
 ## Key concepts (easy terms)
 
@@ -36,8 +32,6 @@ Charging is limited by:
 - `siteMaxKw` (overall site limit)
 - `gridLimitKw[t]` (time‑varying limit)
 - `connectorMaxKw` (per connector maximum power)
-
----
 
 ## How to run (development)
 
