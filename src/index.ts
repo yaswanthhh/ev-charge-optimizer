@@ -1,8 +1,13 @@
 import express from "express";
 import { sendSetChargingProfile } from "./chargerStub.ts";
 import { Pool } from "pg";
+import http from "http";
+import { WebSocketServer } from "ws";
+import cors from "cors";
+
 
 const app = express();
+app.use(cors({ origin: "http://localhost:5173" }));
 app.use(express.json());
 
 const pool = new Pool({
@@ -12,6 +17,21 @@ const pool = new Pool({
     password: process.env.PGPASSWORD ?? "ev",
     database: process.env.PGDATABASE ?? "evopt",
 });
+
+function sleep(ms: number) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForAck(chargerId: string, since: number, timeoutMs: number) {
+    const end = Date.now() + timeoutMs;
+    while (Date.now() < end) {
+        const ack = lastAck.get(chargerId);
+        if (ack && ack.at >= since) return ack;
+        await sleep(50);
+    }
+    return null;
+}
+
 
 app.post("/dispatch", (req, res) => {
     const { chargerId, setChargingProfile } = req.body as {
@@ -212,38 +232,57 @@ app.post("/run-and-dispatch", async (req, res) => {
     };
 
     // 2) build + dispatch one OCPP profile per connectorId (1..n)
-    const dispatchResults = perConnectorKw[0].map((_ignored, idxConnector) => {
-        const connectorId = idxConnector + 1;
+    const sentAt = Date.now();
 
-        const perStepKw = perConnectorKw.map((row) => row[idxConnector]);
+    const dispatchResults = await Promise.all(
+        perConnectorKw[0].map(async (_ignored, idxConnector) => {
+            const connectorId = idxConnector + 1;
 
-        const chargingSchedulePeriod = perStepKw.map((kw, idx) => ({
-            startPeriod: idx * stepSeconds,
-            limit: Math.round(kw * 1000 * 10) / 10, // W
-        }));
+            const perStepKw = perConnectorKw.map((row) => row[idxConnector]);
 
-        const setChargingProfile = {
-            connectorId,
-            csChargingProfiles: {
-                chargingProfileId: 1,
-                stackLevel: 0,
-                chargingProfilePurpose: "TxDefaultProfile",
-                chargingProfileKind: "Absolute",
-                chargingSchedule: {
-                    chargingRateUnit: "W",
-                    chargingSchedulePeriod,
+            const chargingSchedulePeriod = perStepKw.map((kw, idx) => ({
+                startPeriod: idx * stepSeconds,
+                limit: Math.round(kw * 1000 * 10) / 10, // W
+            }));
+
+            const setChargingProfile = {
+                connectorId,
+                csChargingProfiles: {
+                    chargingProfileId: 1,
+                    stackLevel: 0,
+                    chargingProfilePurpose: "TxDefaultProfile",
+                    chargingProfileKind: "Absolute",
+                    chargingSchedule: {
+                        chargingRateUnit: "W",
+                        chargingSchedulePeriod,
+                    },
                 },
-            },
-        };
+            };
 
-        // stubbed dispatch result
-        return {
-            connectorId,
-            result: { status: "Accepted" as const },
-            setChargingProfile,
-            chargerId,
-        };
-    });
+            const ws = chargers.get(chargerId);
+            if (!ws) {
+                return {
+                    connectorId,
+                    result: { status: "NotConnected" as const },
+                    setChargingProfile,
+                    chargerId,
+                };
+            }
+
+            ws.send(JSON.stringify(setChargingProfile));
+
+            const ack = await waitForAck(chargerId, sentAt, 2000);
+
+            return {
+                connectorId,
+                result: { status: ack ? ("Accepted" as const) : ("NoAckYet" as const) },
+                ack: ack?.msg ?? null,
+                setChargingProfile,
+                chargerId,
+            };
+        })
+    );
+
 
     // 3) store run in DB
     const dbRow = await pool.query(
@@ -261,4 +300,35 @@ app.post("/run-and-dispatch", async (req, res) => {
 
 
 const port = Number(process.env.PORT ?? 3000);
-app.listen(port, () => console.log(`API listening on http://localhost:${port}`));
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
+
+// In-memory map: chargerId -> ws connection
+const chargers = new Map<string, import("ws").WebSocket>();
+const lastAck = new Map<string, { at: number; msg: any }>();
+
+wss.on("connection", (ws, req) => {
+    const url = req.url ?? "/";
+    // Expect ws://host:3000/ocpp/CHARGER_ID
+    const parts = url.split("/").filter(Boolean);
+    if (parts[0] !== "ocpp" || !parts[1]) {
+        ws.close();
+        return;
+    }
+    const chargerId = parts[1];
+    chargers.set(chargerId, ws);
+
+    ws.on("close", () => chargers.delete(chargerId));
+    ws.on("message", (data) => {
+        // for now just log; later we’ll parse OCPP messages
+        console.log("WS message from", chargerId, data.toString());
+    });
+
+    ws.send("connected");
+});
+
+server.listen(port, () => {
+    console.log(`API listening on http://localhost:${port}`);
+    console.log(`OCPP WS listening on ws://localhost:${port}/ocpp/{chargerId}`);
+});
